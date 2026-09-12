@@ -1,10 +1,12 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
+import mermaid from 'astro-mermaid';
 import starlight from '@astrojs/starlight';
 import react from '@astrojs/react';
 
 export default defineConfig({
   integrations: [
+    mermaid(),
     starlight({
       title: 'WAL: The Definitive Tutorial',
       description: 'Write-Ahead Logging from fundamentals to industry expert',
