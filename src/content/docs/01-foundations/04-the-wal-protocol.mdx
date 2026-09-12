@@ -1,0 +1,226 @@
+---
+title: "The WAL Protocol"
+description: "The golden rule of Write-Ahead Logging — the invariant that makes everything work"
+sidebar:
+  order: 4
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import WalFlowSimulator from '../../../components/WalFlowSimulator';
+
+Everything you've learned so far leads to this: the WAL Protocol itself. This is the single most important invariant in database systems — a simple rule with profound consequences.
+
+## The Golden Rule
+
+> **Log records describing a modification must be written to stable storage BEFORE the modified data page is written to stable storage.**
+
+That's it. This one rule — universally known as the **Write-Ahead Logging protocol** or **WAL rule** — is what makes Steal + No-Force recovery possible.
+
+In pseudocode:
+
+```
+function write_page_to_disk(page):
+    // BEFORE writing the data page...
+    wal_lsn = page.latest_modification_lsn
+    flush_wal_up_to(wal_lsn)     // Ensure WAL is durable past this LSN
+    
+    // ...NOW it's safe to write the page
+    write(data_file, page)
+```
+
+<Aside type="tip" title="Memory Hook: The Golden Rule Mantra">
+**"Log before Lob"** — always write the **Log** before you **Lob** (toss) the data page to disk. If you remember nothing else about WAL, remember this.
+</Aside>
+
+## Why It Works: A Proof Sketch
+
+The WAL rule guarantees recovery correctness through a simple chain of reasoning:
+
+**Case 1: Crash before WAL fsync (before commit)**
+- WAL record not durable → recovery won't see the change → nothing to redo
+- Data page might not be on disk → no inconsistency
+- Result: transaction effectively never happened ✓
+
+**Case 2: Crash after WAL fsync, before data page write**
+- WAL record IS durable → recovery WILL redo the change
+- Data page is stale → redo brings it up to date
+- Result: committed changes are recovered ✓
+
+**Case 3: Crash after both WAL and data page written**
+- WAL record IS durable, data page IS current
+- Redo is idempotent (page LSN ≥ record LSN → skip)
+- Result: no work needed, already consistent ✓
+
+**Case 4: Stolen uncommitted page on disk**
+- WAL rule ensures the log record exists before the page
+- No COMMIT record in log → undo pass reverses the change
+- Result: uncommitted data removed ✓
+
+## The LSN Mechanism
+
+The WAL rule is enforced using **Log Sequence Numbers (LSNs)** — monotonically increasing identifiers assigned to each log record.
+
+Every data page stores a **page-LSN** in its header: the LSN of the most recent log record that modified this page.
+
+```
+Log File:                          Data Page Header:
+┌──────────────────────┐          ┌─────────────────┐
+│ LSN=1: UPDATE P5     │          │ Page 5           │
+│ LSN=2: INSERT P3     │          │ page_lsn = 7     │
+│ LSN=3: DELETE P8     │          │ ...data...       │
+│ ...                  │          └─────────────────┘
+│ LSN=7: UPDATE P5     │
+│ LSN=8: COMMIT T1     │   Buffer manager check:
+└──────────────────────┘   "Before flushing P5,
+                            WAL must be durable
+                            through at least LSN=7"
+```
+
+### How the Buffer Manager Uses LSNs
+
+When the buffer manager wants to write a dirty page to disk:
+
+```python
+def flush_page(page):
+    # WAL RULE ENFORCEMENT
+    if wal_flushed_lsn < page.lsn:
+        flush_wal(up_to=page.lsn)  # Force WAL to disk first!
+    
+    # Now safe to write the page
+    os.write(data_fd, page.data)
+```
+
+### How Recovery Uses LSNs
+
+During redo, the page-LSN enables **idempotent replay**:
+
+```python
+def redo_record(record, page):
+    if page.lsn >= record.lsn:
+        # Page already has this change (or later) — SKIP
+        return
+    
+    # Page is stale — apply the change
+    apply(record, page)
+    page.lsn = record.lsn
+```
+
+This means redo can be safely repeated after any crash during recovery itself. No special logic needed.
+
+<Aside type="caution" title="Expert Subtlety: Physiological Logging">
+Most systems use **physiological logging**: log records identify a page + the operation within that page (e.g., "insert tuple at offset 42 on page 5"). This is between pure physical logging (byte-level diffs) and pure logical logging (SQL statements). Physiological logging is page-physical but page-internal-logical, which gives the best balance of log size and redo simplicity.
+</Aside>
+
+## The Commit Protocol
+
+Building on the WAL rule, here's the complete commit protocol:
+
+```
+COMMIT Transaction T:
+1. Append COMMIT record for T to WAL buffer
+2. Flush WAL buffer to WAL file on disk (write)
+3. fsync the WAL file                           ← DURABILITY POINT
+4. Return SUCCESS to client
+5. [Eventually] Flush dirty pages to data files  ← Lazy, async
+```
+
+The key properties:
+- **Only ONE fsync** needed for commit (the WAL fsync)
+- Data page writes are **deferred** — they happen during checkpoint
+- The COMMIT record in the WAL is the **source of truth** for whether a transaction committed
+
+## See It In Action
+
+<div class="simulator-container">
+<h3>Interactive: WAL Commit Protocol Flow</h3>
+<WalFlowSimulator client:visible />
+</div>
+
+## Enforcing the WAL Rule: Implementation Patterns
+
+### PostgreSQL
+```c
+// In bufmgr.c — before flushing a buffer
+if (XLogNeedsFlush(bufHdr->lsn)) {
+    XLogFlush(bufHdr->lsn);  // Force WAL to this LSN
+}
+// Now safe to write the buffer
+smgrwrite(reln, forknum, bufHdr->tag.blockNum, ...);
+```
+
+### SQLite WAL Mode
+SQLite takes a different approach: the data file is read-only during normal operations. All modifications go into the WAL file. Readers read from the data file + WAL overlay. Checkpoint (which writes WAL back to data file) replaces the buffer flush.
+
+### InnoDB
+```
+mini-transaction (mtr) commit:
+1. Copy mtr log records to redo log buffer
+2. Update page LSN for all modified pages
+3. Release page latches
+// At transaction commit:
+4. Append COMMIT record to redo log
+5. fsync redo log (group commit optimization)
+```
+
+## Two Invariants That Must Never Be Violated
+
+### Invariant 1: Write-Ahead
+> A data page with page-LSN = N must not be written to disk unless the WAL is flushed through at least LSN N.
+
+Violation → committed changes lost on crash.
+
+### Invariant 2: Commit = Log Record Durable
+> A transaction is committed if and only if its COMMIT record is on stable storage.
+
+Violation → client told "success" but data lost on crash (durability breach).
+
+## The WAL Protocol in One Diagram
+
+```
+Transaction T modifies pages P1, P2:
+
+  Time ──────────────────────────────────────────────────────►
+
+  WAL:  [Rec1:T,P1] [Rec2:T,P2] [COMMIT:T]
+                                       │
+                                  fsync WAL ← DURABILITY BOUNDARY
+                                       │
+  Client:                          "OK" ←─ SUCCESS returned
+                                       
+  Data:  ............ [P1 flush] ........... [P2 flush] ......
+                           │                     │
+                      WAL rule: WAL flushed    Same: WAL already
+                      past Rec1.LSN first      flushed past Rec2.LSN
+
+  Key:  WAL fsync is SYNCHRONOUS (in commit path)
+        Data flushes are ASYNCHRONOUS (in background/checkpoint)
+```
+
+## Key Takeaways
+
+1. **The WAL Rule:** Log must be durable before the modified page is written to disk
+2. **LSNs** enforce the WAL rule — page-LSN compared to WAL flush position
+3. **Commit = COMMIT record durable in WAL.** Nothing else matters.
+4. **Redo is idempotent** because of page-LSN comparison — safe to replay multiple times
+5. **One fsync** at commit (the WAL) instead of many (the data pages) — this is WAL's performance advantage
+
+<div class="self-check">
+<details>
+<summary>Quick Quiz: The WAL Protocol</summary>
+
+1. **State the WAL rule in one sentence.**
+   → Log records must be durable on stable storage before the modified data page is written to stable storage.
+
+2. **What happens if you violate the WAL rule?**
+   → A crash can leave committed data missing from both the log and the data file. Unrecoverable data loss.
+
+3. **Why is redo idempotent?**
+   → Each page stores its page-LSN. If page-LSN ≥ record LSN, the change is already applied, so redo skips it. Safe to replay any number of times.
+
+4. **What's the minimum number of fsyncs to commit a transaction?**
+   → One: the WAL fsync. Data page fsyncs are deferred to checkpoint time.
+
+5. **What is physiological logging?**
+   → Log records that are physical at the page level (identify which page) but logical within the page (describe the operation, not byte-level diffs). Used by most modern databases.
+</details>
+</div>

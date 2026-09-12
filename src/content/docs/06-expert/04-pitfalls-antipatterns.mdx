@@ -1,0 +1,340 @@
+---
+title: "Pitfalls & Anti-Patterns"
+description: "Common WAL mistakes that cause data loss, disk exhaustion, and silent corruption — with detection and fixes"
+sidebar:
+  order: 4
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+WAL is deceptively simple: append log, fsync, replay on crash. But the gap between understanding the protocol and operating it correctly in production is where databases die. This page catalogs the most dangerous WAL anti-patterns — each with what goes wrong, how to detect it, and how to fix it.
+
+## Anti-Pattern Reference
+
+| # | Anti-Pattern | Severity | Data Loss Risk |
+|---|-------------|----------|----------------|
+| 1 | Stale replication slots | 🔴 Critical | WAL disk full → write halt |
+| 2 | CDC without monitoring restart_lsn | 🔴 Critical | Same as #1 |
+| 3 | fsync=off in production | 🔴 Critical | Silent commit loss |
+| 4 | synchronous_commit=off for financial data | 🔴 Critical | Last ~200ms of commits |
+| 5 | WAL on same disk as data | 🟡 High | I/O contention, correlated failure |
+| 6 | Ignoring full_page_writes tradeoff | 🟡 High | Torn page unrecoverable |
+| 7 | Assuming io_uring write CQE = durable | 🔴 Critical | False commit acknowledgment |
+| 8 | Aggressive manual SQLite checkpointing | 🟡 High | WAL-Reset race (see Ch. 6) |
+| 9 | Not testing PITR backups | 🔴 Critical | Backup theater |
+
+---
+
+## 1. Stale Replication Slots
+
+**What goes wrong:** A replication slot tracks a consumer's WAL progress. If the consumer dies without dropping the slot, PostgreSQL retains all WAL from `restart_lsn` forward — forever. The WAL directory grows until the disk fills, at which point PostgreSQL **refuses all writes**.
+
+```
+Day 1:  Slot created, consumer active     WAL: 1GB
+Day 3:  Consumer crashes, slot orphaned    WAL: 5GB
+Day 7:  Nobody noticed                     WAL: 20GB
+Day 14: Disk 90% full                      WAL: 50GB
+Day 15: INSERT fails — disk full           💀 WRITE HALT
+```
+
+**How to detect:**
+
+```sql
+SELECT slot_name, active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM pg_replication_slots
+WHERE NOT active;
+```
+
+**How to fix:**
+
+```sql
+-- Verify consumer is truly dead, then drop
+SELECT pg_drop_replication_slot('dead_slot_name');
+
+-- Prevent: set max_slot_wal_keep_size (PG 13+)
+ALTER SYSTEM SET max_slot_wal_keep_size = '10GB';
+```
+
+---
+
+## 2. CDC Without Monitoring restart_lsn
+
+**What goes wrong:** Same as stale slots, but specifically in CDC pipelines. Debezium connector paused, Kafka down, or consumer lagging — the slot retains WAL while nobody watches `restart_lsn`.
+
+**How to detect:**
+
+```sql
+-- Alert if any slot retains > 1GB and lag > 5 minutes
+SELECT slot_name,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS retained_bytes,
+       pg_wal_lsn_diff(confirmed_flush_lsn, restart_lsn) AS consumed_bytes
+FROM pg_replication_slots;
+```
+
+Set alerts on:
+- `retained_bytes > 1GB` for any slot
+- `confirmed_flush_lsn` not advancing for > 5 minutes
+- `pg_ls_waldir()` total size > 50% of disk
+
+**How to fix:** Monitor `restart_lsn` in your observability stack (Datadog, Prometheus + postgres_exporter). Automate slot cleanup for inactive consumers.
+
+---
+
+## 3. fsync=off in Production
+
+**What goes wrong:** PostgreSQL returns "commit successful" but WAL records sit in the OS page cache. A crash (power loss, kernel panic, OOM kill) loses all unflushed commits — potentially seconds of transactions told "OK."
+
+```
+Client: COMMIT → "OK" (returned immediately)
+OS:     WAL in page cache (not on disk)
+⚡ Power loss
+Recovery: Last durable LSN is 30 seconds ago
+Result: 30 seconds of "committed" data gone
+```
+
+**How to detect:**
+
+```sql
+SHOW fsync;  -- Must be 'on'
+```
+
+Also check `postgresql.conf` for overrides and verify mount options (`mount | grep pgdata` — no `nobarrier` or `data=writeback` on ext4).
+
+**How to fix:**
+
+```ini
+fsync = on                  # Non-negotiable
+full_page_writes = on       # Also non-negotiable
+synchronous_commit = on     # For durable commits
+```
+
+<Aside type="danger" title="Never fsync=off in Production">
+The only acceptable use of `fsync=off` is a disposable development database you can recreate. There are no exceptions for staging, QA, or "it's fast this way."
+</Aside>
+
+---
+
+## 4. synchronous_commit=off for Financial Data
+
+**What goes wrong:** Async commit returns success before WAL fsync. On crash, the last `wal_writer_delay` milliseconds of commits (default ~200ms) may be lost. For a payment system processing 100 TPS, that's ~20 lost transactions per crash.
+
+**How to detect:**
+
+```sql
+SHOW synchronous_commit;  -- Must be 'on' for critical data
+
+-- Check if anyone overrode per-session
+SELECT pid, query, state
+FROM pg_stat_activity
+WHERE query LIKE '%synchronous_commit%';
+```
+
+**How to fix:**
+
+```ini
+synchronous_commit = on   # Global default
+
+# Per-transaction override only for explicitly non-critical ops:
+# SET LOCAL synchronous_commit = off;  -- inside a known-safe transaction
+```
+
+---
+
+## 5. WAL on Same Disk as Data
+
+**What goes wrong:** WAL writes (sequential) and data page writes (random) compete for the same disk I/O bandwidth. During checkpoints, the contention spikes — WAL fsync latency increases, commit latency spikes, and a single disk failure loses both data and WAL.
+
+**How to detect:**
+
+```bash
+# Check if pg_wal is on the same filesystem as data
+df $(pg_config --bindir)/../share/  # data directory
+df $PGDATA/pg_wal                    # WAL directory — should differ
+
+# I/O latency correlation during checkpoints
+# pg_stat_checkpointer.sync_time spikes correlate with commit latency
+```
+
+**How to fix:**
+
+```bash
+# Move WAL to dedicated NVMe
+pg_ctl stop
+mv $PGDATA/pg_wal /mnt/nvme-wal/
+ln -s /mnt/nvme-wal $PGDATA/pg_wal
+pg_ctl start
+```
+
+---
+
+## 6. Ignoring full_page_writes Tradeoff
+
+**What goes wrong:** Disabling `full_page_writes` saves WAL volume (~30-50% reduction) but removes protection against **torn pages** — when a crash occurs mid-page-write, leaving a page with old and new content mixed. Without FPI, redo cannot fix torn pages.
+
+**How to detect:**
+
+```sql
+SHOW full_page_writes;  -- Must be 'on' unless you have atomic page writes
+
+-- High FPI rate is normal; zero FPI with fpw=off is the danger
+SELECT wal_fpi, wal_records FROM pg_stat_wal;
+```
+
+**How to fix:**
+
+```ini
+full_page_writes = on       # Default and recommended
+wal_compression = on        # Reduce FPI volume instead of disabling FPI
+```
+
+Only disable if you have **confirmed atomic page writes** (PG 15+ `io_uring` with `RWF_ATOMIC`, or specific hardware guarantees).
+
+---
+
+## 7. Assuming io_uring Write CQE = Durable
+
+**What goes wrong:** With io_uring, a write completion event (CQE) means data reached the **kernel page cache** — not stable storage. Acknowledging commits on write CQE alone violates the WAL protocol's durability invariant.
+
+```c
+// BUG: acknowledging commit here
+io_uring_wait_cqe(&ring, &cqe);  // write CQE — NOT durable!
+
+// CORRECT: wait for linked fsync CQE
+io_uring_wait_cqe(&ring, &cqe);  // write CQE
+io_uring_wait_cqe(&ring, &cqe);  // fsync CQE — NOW durable
+```
+
+**How to detect:** Code review any custom WAL implementation using io_uring. Verify fsync CQE is awaited before commit acknowledgment.
+
+**How to fix:** Always link write + fsync SQEs with `IOSQE_IO_LINK` and wait for both CQEs.
+
+---
+
+## 8. Aggressive Manual SQLite Checkpointing
+
+**What goes wrong:** Calling `SQLITE_CHECKPOINT_RESTART` or `TRUNCATE` frequently (especially concurrent with writers) triggers the **WAL-Reset race condition** — see the case study in [Debugging Corruption](/06-expert/03-debugging-corruption/). Data is silently lost.
+
+**How to detect:**
+
+```sql
+-- Monitor WAL size and checkpoint frequency
+PRAGMA wal_checkpoint(PASSIVE);  -- returns (busy, log, checkpointed)
+
+-- If log frames >> checkpointed frames regularly, checkpoint is struggling
+-- If using RESTART/TRUNCATE modes in production → red flag
+```
+
+**How to fix:**
+
+```sql
+-- Use PASSIVE mode (default) — never blocks writers
+PRAGMA wal_autocheckpoint = 1000;  -- pages (default 1000)
+
+-- Avoid RESTART/TRUNCATE in production with concurrent writers
+-- Let auto-checkpoint handle it
+```
+
+---
+
+## 9. Not Testing PITR Backups
+
+**What goes wrong:** You configure WAL archiving, take base backups, and assume recovery works. When corruption strikes, you discover: archive gaps, wrong `restore_command`, incompatible backup format, or the backup itself is corrupt. **Untested backups are not backups.**
+
+**How to detect:**
+
+```bash
+# Check for archive gaps
+ls pg_wal/archive_status/*.ready  # Should be empty (all .done)
+
+# Verify latest base backup age
+ls -lt /backups/base/ | head -5
+
+# When did you last TEST a restore? (if never → this anti-pattern)
+```
+
+**How to fix:**
+
+```bash
+# Monthly PITR test procedure
+# 1. Restore latest base backup to test instance
+pg_basebackup -D /test-restore -Ft -z -P
+
+# 2. Configure recovery
+cat > /test-restore/postgresql.conf <<EOF
+restore_command = 'cp /archive/%f %p'
+recovery_target_time = '2026-01-15 12:00:00'
+recovery_target_action = 'promote'
+EOF
+
+# 3. Start and verify data
+pg_ctl -D /test-restore start
+psql -c "SELECT count(*) FROM critical_table;"
+
+# 4. Document results, fix any gaps found
+```
+
+<Aside type="tip" title="Memory Hook: PITR Test = Fire Drill">
+You don't wait for a fire to test the sprinkler system. Schedule monthly PITR restores — the 30 minutes spent testing saves days of panic during a real incident.
+</Aside>
+
+## Quick Detection Dashboard
+
+```sql
+-- Run this daily — covers most anti-patterns
+SELECT 'fsync' AS check, setting AS value,
+       CASE WHEN setting = 'on' THEN 'OK' ELSE '🔴 FIX NOW' END AS status
+FROM pg_settings WHERE name = 'fsync'
+UNION ALL
+SELECT 'full_page_writes', setting,
+       CASE WHEN setting = 'on' THEN 'OK' ELSE '🟡 REVIEW' END
+FROM pg_settings WHERE name = 'full_page_writes'
+UNION ALL
+SELECT 'synchronous_commit', setting,
+       CASE WHEN setting = 'on' THEN 'OK' ELSE '🟡 REVIEW' END
+FROM pg_settings WHERE name = 'synchronous_commit'
+UNION ALL
+SELECT 'inactive_slots', count(*)::text,
+       CASE WHEN count(*) = 0 THEN 'OK' ELSE '🔴 DROP SLOTS' END
+FROM pg_replication_slots WHERE NOT active
+UNION ALL
+SELECT 'wal_retention_max', pg_size_pretty(max(retained)),
+       CASE WHEN max(retained) > 1073741824 THEN '🔴 >1GB' ELSE 'OK' END
+FROM (
+  SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS retained
+  FROM pg_replication_slots
+) s;
+```
+
+## Key Takeaways
+
+1. **Stale replication slots** are the #1 cause of WAL disk exhaustion — monitor and auto-clean
+2. **fsync=off and async commit** trade durability for speed — never on critical data
+3. **WAL on a separate disk** prevents I/O contention and correlated failure
+4. **io_uring write CQE ≠ durable** — always await the fsync CQE
+5. **Test PITR monthly** — untested backups are wishful thinking
+
+<div class="self-check">
+<details>
+<summary>Quick Quiz: Pitfalls & Anti-Patterns</summary>
+
+1. **What happens when a replication slot becomes inactive?**
+   → PostgreSQL retains all WAL from restart_lsn, eventually filling the disk and halting all writes.
+
+2. **Why is fsync=off dangerous?**
+   → Commits return success before WAL reaches stable storage; a crash loses all unflushed transactions with no error indication.
+
+3. **What is the io_uring durability trap?**
+   → Treating the write CQE as durable when data is only in the kernel page cache — must wait for the fsync CQE.
+
+4. **Why is aggressive SQLite checkpointing risky?**
+   → RESTART/TRUNCATE modes can trigger the WAL-Reset race, causing silent data loss between checkpoint reset and header update.
+
+5. **How do you detect WAL/data disk colocation?**
+   → Compare filesystem mount points: df on pgdata vs pg_wal — they should be on separate devices.
+
+6. **What is "backup theater"?**
+   → Configuring backups and archiving but never testing recovery — discovering failures only during a real incident.
+
+</details>
+</div>

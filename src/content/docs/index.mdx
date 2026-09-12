@@ -1,0 +1,149 @@
+---
+title: "WAL: The Definitive Tutorial"
+description: "Master Write-Ahead Logging from fundamentals to industry expert"
+template: splash
+hero:
+  tagline: "Master Write-Ahead Logging — the single most important concept in database internals. From crash recovery basics to cutting-edge NVM research."
+  actions:
+    - text: Start Learning
+      link: /01-foundations/01-the-crash-problem/
+      icon: right-arrow
+    - text: Quick Reference
+      link: /07-reference/01-cheat-sheet/
+      variant: minimal
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Learning Roadmap
+
+Seven chapters. Progressive difficulty. From "why do databases crash?" to "how does Aurora's log-is-the-database architecture work?" — each chapter builds on the last.
+
+### Chapter 1: Foundations
+
+**Level:** Beginner · **Time:** ~45 min
+
+Why databases need WAL. The crash problem, ACID durability, the Steal/Force matrix, and the WAL protocol itself — the single invariant every database must maintain.
+
+| Page | Topic |
+|------|-------|
+| [The Crash Problem](/01-foundations/01-the-crash-problem/) | Why partial writes break databases |
+| [ACID & Durability](/01-foundations/02-acid-and-durability/) | How WAL provides the D in ACID |
+| [Steal/Force Matrix](/01-foundations/03-steal-force-matrix/) | Buffer management policy choices |
+| [The WAL Protocol](/01-foundations/04-the-wal-protocol/) | The one rule that must never break |
+
+### Chapter 2: Core Mechanics
+
+**Level:** Beginner–Intermediate · **Time:** ~60 min
+
+Log records, LSNs, file formats, checkpoints, group commit, and concurrency. The mechanical details of how WAL works inside a database engine.
+
+| Page | Topic |
+|------|-------|
+| [Log Records & LSN](/02-core-mechanics/01-log-records-and-lsn/) | Record structure and sequence numbers |
+| [WAL File Formats](/02-core-mechanics/02-wal-file-formats/) | On-disk layout across systems |
+| [Checkpoints](/02-core-mechanics/03-checkpoints/) | Bounding recovery, enabling recycling |
+| [Group Commit](/02-core-mechanics/04-group-commit/) | Batching fsyncs for throughput |
+| [Concurrency](/02-core-mechanics/05-concurrency/) | WAL and multi-writer coordination |
+
+### Chapter 3: ARIES Recovery
+
+**Level:** Intermediate · **Time:** ~75 min
+
+The ARIES algorithm — Analysis, Redo, Undo — with CLRs, the ATT/DPT, and a full worked example. The recovery algorithm behind PostgreSQL, DB2, and SQL Server.
+
+| Page | Topic |
+|------|-------|
+| [Overview](/03-aries/01-overview/) | Three-pass recovery model |
+| [Analysis Pass](/03-aries/02-analysis-pass/) | Building ATT and DPT |
+| [Redo Pass](/03-aries/03-redo-pass/) | Idempotent forward replay |
+| [Undo Pass & CLRs](/03-aries/04-undo-pass/) | Rolling back active transactions |
+| [Worked Example](/03-aries/05-worked-example/) | Step-by-step crash recovery |
+
+### Chapter 4: Real Systems
+
+**Level:** Intermediate · **Time:** ~60 min
+
+How production databases implement WAL: SQLite, PostgreSQL, InnoDB, and LSM-tree engines. Compare architectures side by side.
+
+| Page | Topic |
+|------|-------|
+| [SQLite WAL](/04-real-systems/01-sqlite-wal/) | Frame-based WAL, checkpoint modes |
+| [PostgreSQL WAL](/04-real-systems/02-postgresql-wal/) | Segments, XLogRecords, PITR |
+| [InnoDB Redo/Undo](/04-real-systems/03-innodb-redo-undo/) | Mini-transactions, doublewrite |
+| [LSM Engines](/04-real-systems/04-lsm-engines/) | RocksDB/Pebble WAL for memtables |
+
+### Chapter 5: Distributed WAL
+
+**Level:** Advanced · **Time:** ~60 min
+
+Consensus logs, distributed database architectures, change data capture, and event sourcing. When the log spans machines.
+
+| Page | Topic |
+|------|-------|
+| [Raft Consensus Log](/05-distributed/01-raft-consensus-log/) | Distributed WAL via quorum replication |
+| [Distributed Databases](/05-distributed/02-distributed-databases/) | CockroachDB, TiKV, Aurora, OceanBase |
+| [CDC from WAL](/05-distributed/03-cdc-from-wal/) | Logical decoding, Debezium, outbox |
+| [Event Sourcing](/05-distributed/04-event-sourcing/) | Domain events as a WAL pattern |
+
+### Chapter 6: Expert Topics
+
+**Level:** Expert · **Time:** ~75 min
+
+Performance tuning, modern hardware (NVMe, PMEM, io_uring), corruption debugging, and production anti-patterns. For DBAs and engine developers.
+
+| Page | Topic |
+|------|-------|
+| [Performance Tuning](/06-expert/01-performance-tuning/) | pg_stat views, config matrix, benchmarks |
+| [Modern Hardware](/06-expert/02-modern-hardware/) | NVMe, PMEM, WBL, io_uring |
+| [Debugging Corruption](/06-expert/03-debugging-corruption/) | pg_waldump, PITR, WAL-Reset bug |
+| [Pitfalls & Anti-Patterns](/06-expert/04-pitfalls-antipatterns/) | Stale slots, fsync=off, untested backups |
+
+### Chapter 7: Reference
+
+**Level:** All · **Time:** As needed
+
+Quick-reference materials: cheat sheet, interview questions, paper reading list, and complete glossary.
+
+| Page | Topic |
+|------|-------|
+| [Cheat Sheet](/07-reference/01-cheat-sheet/) | One-page WAL reference |
+| [Interview Questions](/07-reference/02-interview-questions/) | 40 questions, fundamentals to expert |
+| [Papers & Reading List](/07-reference/03-papers-reading-list/) | Essential WAL research |
+| [Glossary](/07-reference/04-glossary/) | ~60 terms defined |
+
+---
+
+## How to Use This Tutorial
+
+### Progressive Difficulty
+
+Chapters 1–2 assume no prior WAL knowledge. Chapter 3 (ARIES) is the inflection point — if you understand three-pass recovery, everything after clicks into place. Chapters 5–6 are for engineers who operate or build database systems.
+
+<Aside type="tip" title="Recommended Path">
+**First time?** Read Chapters 1–4 sequentially. **Interview prep?** Jump to [Cheat Sheet](/07-reference/01-cheat-sheet/) + [Interview Questions](/07-reference/02-interview-questions/). **Production DBA?** Start at [Performance Tuning](/06-expert/01-performance-tuning/) and [Pitfalls](/06-expert/04-pitfalls-antipatterns/).
+</Aside>
+
+### Self-Check Quizzes
+
+Every content page ends with a **Quick Quiz** — expandable `<details>` sections with questions and answers. Use them to verify understanding before moving to the next chapter. If you can't answer a quiz question, re-read that section.
+
+### Interactive Demos
+
+Several pages include interactive React components:
+
+- **Crash Recovery Demo** (Chapter 1) — watch WAL protect against partial writes
+- **Replication Flow Demo** (Chapter 5) — trace WAL records through replication and CDC
+
+### Memory Hooks
+
+Look for the 💡 **Memory Hook** asides throughout — analogies designed to make concepts stick. "WAL is a film reel." "Checkpoint is a save point." "CDC is WAL's public API."
+
+### Estimated Total Time
+
+| Audience | Chapters | Time |
+|----------|----------|------|
+| Curious developer | 1–2 | ~2 hours |
+| Backend engineer | 1–4 | ~4 hours |
+| Database engineer | 1–6 | ~6 hours |
+| Complete mastery | 1–7 + papers | ~10 hours |

@@ -1,0 +1,187 @@
+---
+title: "Interview Questions"
+description: "40 WAL interview questions from fundamentals to expert — with concise answers"
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A comprehensive question bank organized by difficulty. Use these to test your understanding or prepare for database internals interviews.
+
+## Fundamentals (10 Questions)
+
+**1. What is Write-Ahead Logging?**
+→ A durability protocol where log records describing changes are written and flushed to stable storage *before* the modified data pages, ensuring crash recoverability.
+
+**2. What is an LSN?**
+→ Log Sequence Number — a monotonically increasing identifier for a position in the WAL stream. In PostgreSQL, a 64-bit byte offset.
+
+**3. How does WAL relate to ACID?**
+→ WAL provides the **D** (Durability) in ACID. Atomicity is achieved by logging all changes before commit; consistency is maintained because redo/undo restore valid states.
+
+**4. What happens during a crash without WAL?**
+→ Partially written pages create inconsistent state. Multi-page transactions leave some changes applied and others missing — violating atomicity and potentially consistency.
+
+**5. What is the difference between redo and undo?**
+→ **Redo** re-applies committed changes that weren't flushed to data pages. **Undo** rolls back uncommitted changes that were flushed (steal policy).
+
+**6. Why is redo idempotent?**
+→ Each data page stores a page-LSN. During redo, if page-LSN ≥ record LSN, the change is already applied and skipped. Safe to replay any number of times.
+
+**7. What does fsync do?**
+→ Forces all buffered data for a file descriptor to stable storage (disk). The durability boundary for WAL — no fsync means no durability guarantee.
+
+**8. What is a torn page?**
+→ A page partially written during a crash — containing a mix of old and new content. Typically half a sector old, half new. Prevented by full-page images in WAL.
+
+**9. How many fsyncs does a transaction commit require?**
+→ One: the WAL fsync. Data page writes are deferred to background flush/checkpoint.
+
+**10. What is physiological logging?**
+→ Log records that are physical at the page level (identify which page) but logical within the page (describe the operation). Used by PostgreSQL, InnoDB, and most modern databases.
+
+---
+
+## Intermediate (10 Questions)
+
+**11. What are the three passes of ARIES recovery?**
+→ Analysis (build ATT/DPT from checkpoint + WAL), Redo (replay all changes forward from RedoLSN), Undo (roll back active transactions backward with CLRs).
+
+**12. What is a checkpoint and why is it needed?**
+→ A point in the WAL where all dirty buffers are flushed to disk. Bounds recovery time (redo only from checkpoint forward) and enables WAL recycling.
+
+**13. How does group commit work?**
+→ Multiple concurrent transactions share a single WAL fsync. Backends flush their records to WAL buffers; one fsync durables all pending commits. Amortizes fsync cost.
+
+**14. What are Full-Page Images (FPIs)?**
+→ Complete page snapshots written to WAL after a checkpoint, on first modification of each page. Protect against torn pages during recovery.
+
+**15. What is the Dirty Page Table (DPT)?**
+→ ARIES data structure mapping page IDs to RecLSN — the earliest LSN that must be redone for that page. Built during the Analysis pass.
+
+**16. What is the Active Transaction Table (ATT)?**
+→ ARIES data structure tracking transactions that were active at crash time, with their last LSN. Determines which transactions need undo.
+
+**17. What is a Compensation Log Record (CLR)?**
+→ A log record written during undo to mark an undo action as completed. Prevents re-undo during a second crash recovery. CLRs are never undone.
+
+**18. Explain the Steal/Force policy matrix.**
+→ Steal = flush dirty pages before commit. Force = flush pages at commit. ARIES uses Steal/No-Force: pages may be flushed early, but commit only requires WAL durability.
+
+**19. What is `wal_level = logical` vs `replica`?**
+→ `replica` includes physical changes for streaming replication. `logical` additionally encodes row-level change information for logical decoding and CDC.
+
+**20. How does PostgreSQL's WAL buffer work?**
+→ A shared-memory ring buffer (`wal_buffers`). Backends copy records into it; the WAL writer process flushes to disk. 8 insertion locks stripe concurrent writes.
+
+---
+
+## Advanced (10 Questions)
+
+**21. Why does ARIES use Steal/No-Force?**
+→ Steal allows early eviction of dirty pages (better buffer pool utilization). No-Force avoids flushing all modified pages at commit (only WAL fsync needed). Together: one fsync at commit, flexible buffer management.
+
+**22. How do CLRs prevent infinite undo loops?**
+→ During undo, each rollback action generates a CLR. If the system crashes again during recovery, Analysis finds CLRs and skips already-undone actions. CLRs are never undone themselves.
+
+**23. How does distributed WAL differ from local WAL?**
+→ Local WAL uses fsync on one node. Distributed WAL replicates log entries to a quorum of nodes (Raft/Paxos) before commit. Adds network latency but survives node failures.
+
+**24. What is logical decoding?**
+→ Interpreting physical WAL records as row-level logical changes. Enables CDC without polling. Requires `wal_level = logical` and an output plugin.
+
+**25. What causes WAL bloat from replication slots?**
+→ Inactive slots retain WAL from `restart_lsn`. PostgreSQL never recycles unconsumed WAL. Stale slots can fill the disk and halt writes.
+
+**26. How would you tune WAL for a write-heavy NVMe workload?**
+→ Increase `wal_buffers` (64MB), raise `max_wal_size` (8GB), enable `wal_compression`, keep `synchronous_commit = on` (NVMe fsync is fast), put WAL on dedicated NVMe.
+
+**27. What is the difference between PostgreSQL WAL and MySQL binlog?**
+→ PostgreSQL WAL serves both crash recovery and replication (dual purpose). MySQL separates redo log (InnoDB crash recovery) from binlog (replication) — requiring 2PC between them.
+
+**28. How does Aurora's "log is the database" work?**
+→ Compute nodes write only redo records to shared storage (4/6 quorum). No local data page writes. Storage nodes materialize pages from the log stream on read.
+
+**29. What is the transactional outbox pattern?**
+→ Write business data and an outbox event in the same DB transaction. CDC reads the outbox table from WAL. Gives domain events with DB-level atomicity.
+
+**30. How does LSM-tree WAL differ from B-tree WAL?**
+→ LSM WAL protects the memtable before flush to immutable SSTables. WAL is recycled after memtable flush (not after page checkpoint). Multiple WAL files may exist during concurrent flushes.
+
+---
+
+## Expert (10 Questions)
+
+**31. What is Write-Behind Logging and when is it safe?**
+→ Inverts WAL: write data pages first, log only metadata. Safe only on byte-addressable NVM with atomic stores. 1.3x throughput, 100x faster recovery. Not safe on block devices.
+
+**32. How does PMEM change the WAL fsync model?**
+→ PMEM is byte-addressable via mmap. Durability via CLWB+SFENCE CPU instructions (~100ns) instead of fsync syscalls (~100µs). Eliminates the block I/O layer entirely.
+
+**33. Explain Aurora's 4/6 write quorum.**
+→ Each log record is written to 6 storage nodes across 3 AZs. Any 4 acknowledgments suffice for durability. Survives complete AZ failure plus 1 additional node failure.
+
+**34. Describe the SQLite WAL-Reset bug.**
+→ Race between checkpoint (which truncates WAL and sets frame count = 0) and a concurrent writer (which appends a frame at offset 0). Frame exists but is invisible — silent data loss. Latent 16 years.
+
+**35. Why is io_uring write CQE not sufficient for commit?**
+→ Write CQE means data reached kernel page cache, not stable storage. Must wait for the linked fsync CQE. Treating write CQE as durable violates the WAL protocol.
+
+**36. What is the Log Matching Property in Raft?**
+→ If two logs contain an entry with the same index and term, they are identical in all preceding entries. Enables safe log convergence without overwriting committed entries.
+
+**37. How does CockroachDB handle two WAL layers?**
+→ Raft log (distributed WAL per range) for replication, Pebble WAL (local) for storage engine crash recovery. Quorum on Raft is the primary client-facing durability boundary.
+
+**38. What is the difference between restart_lsn and confirmed_flush_lsn?**
+→ `restart_lsn`: earliest WAL the slot needs (determines retention). `confirmed_flush_lsn`: latest LSN the consumer acknowledged. Gap between them is unconsumed but available WAL.
+
+**39. When would you disable full_page_writes?**
+→ Only with confirmed atomic page writes (specific hardware or PG 15+ io_uring with RWF_ATOMIC). Disabling without atomic writes makes torn pages unrecoverable.
+
+**40. How does event sourcing relate to WAL?**
+→ Both are append-only ordered logs where state = fold(operations). WAL is physical and recycled; events are semantic and permanent. Kafka's commit log is the purest "log IS the database" expression.
+
+---
+
+## Beginner vs Expert Comparison
+
+| Dimension | Beginner | Expert |
+|-----------|----------|--------|
+| **WAL purpose** | "Logs changes for recovery" | "Enforces ordering constraint between log and data durability" |
+| **Commit** | "Write to disk" | "One WAL fsync; data pages async" |
+| **Recovery** | "Replay the log" | "Three-pass ARIES: Analysis → Redo → Undo with CLRs" |
+| **Checkpoints** | "Save state periodically" | "Bound redo scan; enable WAL recycling; trigger FPI generation" |
+| **Replication** | "Copy the database" | "Replicate the WAL stream; physical vs logical decoding" |
+| **Tuning** | "Make it faster" | "pg_test_fsync → identify bottleneck → symptom-specific GUC matrix" |
+| **Distributed** | "Multiple copies" | "Quorum commit on ordered log; two WAL layers; Raft log matching" |
+| **Hardware** | "Use SSD" | "NVMe FUA, PMEM CLWB, io_uring linked SQEs, WBL on NVM" |
+| **Failure modes** | "Database crashes" | "Torn pages, stale slots, WAL-Reset race, silent loss, fsync=CQE confusion" |
+| **Architecture** | "One database" | "Local WAL + distributed log + CDC + event store — all append-only logs" |
+
+<Aside type="tip" title="Self-Assessment">
+Can you answer all 40 without looking? If you struggle at Intermediate, review Chapters 1–3. If Advanced/Expert questions stump you, focus on Chapters 5–6.
+</Aside>
+
+<div class="self-check">
+<details>
+<summary>Quick Quiz: Interview Prep</summary>
+
+1. **What level is "Explain the Steal/Force matrix"?**
+   → Intermediate — requires understanding ARIES policy choices and their tradeoffs.
+
+2. **What distinguishes an expert answer about commit?**
+   → Expert: "One WAL fsync, data pages flushed asynchronously." Beginner: "Write to disk."
+
+3. **Which chapter covers the SQLite WAL-Reset bug?**
+   → Chapter 6: Debugging Corruption — Expert question #34.
+
+4. **What is the most commonly missed io_uring WAL detail?**
+   → Write CQE ≠ durable. Must await fsync CQE (Expert #35).
+
+5. **How many questions are in this bank?**
+   → 40 total: 10 each at Fundamentals, Intermediate, Advanced, and Expert levels.
+
+</details>
+</div>

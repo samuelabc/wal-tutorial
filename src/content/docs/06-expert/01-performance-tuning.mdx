@@ -1,0 +1,260 @@
+---
+title: "Performance Tuning"
+description: "Diagnose and tune PostgreSQL WAL performance — pg_stat views, config matrix, benchmarks, and monitoring"
+sidebar:
+  order: 1
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+WAL I/O is often the **primary bottleneck** for write-heavy PostgreSQL workloads. A single `COMMIT` must fsync the WAL before returning — and if your disk can't keep up, every transaction waits. This page covers systematic diagnosis, a symptom→action tuning matrix, and concrete configuration examples.
+
+## Diagnosis: Where Is the Bottleneck?
+
+Start with PostgreSQL's built-in statistics views:
+
+### pg_stat_wal
+
+```sql
+SELECT wal_records, wal_fpi, wal_bytes,
+       wal_buffers_full, wal_write, wal_sync,
+       stats_reset
+FROM pg_stat_wal;
+```
+
+| Column | What It Tells You |
+|--------|-------------------|
+| `wal_records` | Total WAL records generated |
+| `wal_fpi` | Full-page images written (high = checkpoint churn or first-touch-after-checkpoint) |
+| `wal_bytes` | Total WAL volume — correlate with write throughput |
+| `wal_buffers_full` | Times backends blocked waiting for WAL buffer space |
+| `wal_write` / `wal_sync` | WAL write and fsync call counts |
+
+### pg_stat_checkpointer
+
+```sql
+SELECT num_timed, num_requested, restartpoints_timed, restartpoints_req,
+       write_time, sync_time, buffers_written
+FROM pg_stat_checkpointer;
+```
+
+High `num_requested` (vs `num_timed`) means checkpoints are triggered by WAL volume (`max_wal_size` exceeded) rather than time — a sign to raise `max_wal_size`.
+
+### pg_stat_io (PostgreSQL 16+)
+
+```sql
+SELECT backend_type, object, context,
+       reads, read_time, writes, write_time,
+       extends, extend_time
+FROM pg_stat_io
+WHERE backend_type = 'walwriter' OR context = 'wal';
+```
+
+<Aside type="tip" title="Memory Hook: WAL Tuning = Plumbing Inspection">
+Before changing knobs, **measure the pipes**. `pg_stat_wal` tells you how much water (WAL bytes) flows; `wal_buffers_full` tells you if the pipe is too narrow; `pg_stat_checkpointer` tells you if the drain (checkpoint) runs too often.
+</Aside>
+
+## The Tuning Matrix
+
+| Symptom | Likely Cause | Action | Config Change |
+|---------|-------------|--------|---------------|
+| Frequent checkpoints | `max_wal_size` too low | Raise WAL limit | `max_wal_size = 4GB` (from 1GB) |
+| High FPI rate | Many first-touch-after-checkpoint pages | Enable compression | `wal_compression = on` |
+| `wal_buffers_full` rising | WAL buffer too small for write rate | Increase buffer | `wal_buffers = 64MB` |
+| High commit latency | Sync WAL on slow disk | Async commit or group commit | `synchronous_commit = off` (non-critical) |
+| High commit latency | Single-threaded fsync | Separate WAL disk | Move `pg_wal` to NVMe |
+| WAL write >> WAL sync | Write batching works, sync is bottleneck | Faster storage or async commit | NVMe + `commit_delay` tuning |
+| Checkpoint write spikes | Too many dirty buffers | Spread checkpoint I/O | `checkpoint_completion_target = 0.9` |
+| WAL generation > 100MB/s | Write-heavy workload | Archive tuning + larger segments | `wal_segment_size = 64MB` (initdb only) |
+
+<Aside type="danger" title="synchronous_commit = off Is Not Free">
+Async commit returns success before WAL fsync. You lose up to `wal_writer_delay` of committed transactions on crash. Never use for financial or audit-critical data.
+</Aside>
+
+## Concrete Configuration Examples
+
+### Baseline Production (SSD)
+
+```ini
+# postgresql.conf — general-purpose SSD
+wal_level = replica
+wal_buffers = 16MB
+max_wal_size = 4GB
+min_wal_size = 1GB
+checkpoint_completion_target = 0.9
+wal_compression = on
+full_page_writes = on
+synchronous_commit = on
+```
+
+### High-Throughput OLTP (NVMe)
+
+```ini
+# Optimized for NVMe, write-heavy OLTP
+wal_buffers = 64MB
+max_wal_size = 8GB
+min_wal_size = 2GB
+checkpoint_completion_target = 0.9
+wal_compression = lz4          # PG15+ — faster than pglz
+full_page_writes = on
+synchronous_commit = on
+commit_delay = 0               # NVMe fsync is fast; group commit less needed
+wal_writer_flush_after = 0     # Let OS batch; NVMe handles it
+```
+
+### Analytics / Batch (Tolerates Async)
+
+```ini
+# Batch loads where minor data loss on crash is acceptable
+wal_buffers = 64MB
+max_wal_size = 16GB
+checkpoint_completion_target = 0.9
+wal_compression = on
+synchronous_commit = off       # ⚠️ Not for financial data
+commit_delay = 100             # Microseconds — batch commits
+commit_siblings = 5            # Min concurrent txs for delay
+```
+
+### WAL on Separate Disk
+
+```bash
+# Move pg_wal to dedicated NVMe
+pg_ctl stop
+mv $PGDATA/pg_wal /mnt/nvme/pg_wal
+ln -s /mnt/nvme/pg_wal $PGDATA/pg_wal
+pg_ctl start
+```
+
+Or use a bind mount / tablespace:
+
+```sql
+-- Verify WAL location
+SHOW data_directory;
+SELECT pg_current_wal_lsn();
+```
+
+## Benchmark Methodology
+
+### pg_test_fsync
+
+Tests fsync latency on your WAL disk — the single most important metric:
+
+```bash
+# Run on the WAL disk
+pg_test_fsync -f -s 1
+
+# Sample output:
+# fsync time: 0.123 ms    ← NVMe (good)
+# fsync time: 8.456 ms    ← HDD (WAL bottleneck)
+```
+
+| fsync Latency | Implication |
+|---------------|-------------|
+| < 0.5 ms | NVMe — WAL unlikely to be bottleneck |
+| 0.5–2 ms | Good SSD — acceptable for most workloads |
+| 2–10 ms | SATA SSD or slow NVMe — tune commit_delay |
+| > 10 ms | HDD or overloaded storage — move WAL to faster disk |
+
+### pgbench
+
+```bash
+# Baseline TPS with default WAL settings
+pgbench -i -s 100 mydb
+pgbench -c 32 -j 4 -T 60 mydb
+
+# Test with async commit
+pgbench -c 32 -j 4 -T 60 -M prepared mydb
+# (with synchronous_commit = off in postgresql.conf)
+
+# Compare WAL generation
+SELECT wal_bytes, wal_records, wal_fpi FROM pg_stat_wal;
+```
+
+```bash
+# WAL-specific write test
+pgbench -c 1 -j 1 -T 30 -S mydb   # read-only baseline
+pgbench -c 32 -j 4 -T 30 mydb      # read-write — compare TPS drop
+```
+
+## NVMe vs HDD Tuning Differences
+
+| Parameter | HDD | NVMe |
+|-----------|-----|------|
+| `wal_buffers` | 16–32MB | 64MB+ |
+| `commit_delay` | 100–1000 µs | 0 |
+| `checkpoint_completion_target` | 0.9 | 0.7–0.9 |
+| `wal_writer_delay` | 200ms (default) | 10–50ms |
+| `max_wal_size` | 2GB (limit I/O spikes) | 8–16GB |
+| Separate WAL disk | **Critical** | Recommended |
+| `wal_compression` | **Essential** (reduce I/O) | Nice to have |
+
+<Aside type="note" title="NVMe Changes the Game">
+On NVMe, fsync latency drops from ~8ms (HDD) to ~0.1ms. This makes `synchronous_commit = on` viable at 10,000+ TPS — and reduces the need for async commit tricks that compromise durability.
+</Aside>
+
+## Monitoring Queries for WAL Throughput
+
+```sql
+-- WAL generation rate (run twice, 60s apart, compute delta)
+SELECT pg_size_pretty(wal_bytes) AS total_wal,
+       wal_records,
+       wal_fpi,
+       wal_buffers_full,
+       wal_write,
+       wal_sync
+FROM pg_stat_wal;
+
+-- WAL generation per second (snapshot diff)
+SELECT pg_size_pretty(
+         (wal_bytes - lag(wal_bytes) OVER (ORDER BY now()))
+         / EXTRACT(EPOCH FROM now() - lag(now()) OVER (ORDER BY now()))
+       ) AS wal_bytes_per_sec
+FROM pg_stat_wal;
+
+-- Checkpoint frequency
+SELECT num_timed + num_requested AS total_checkpoints,
+       write_time / NULLIF(num_timed + num_requested, 0) AS avg_write_ms,
+       sync_time / NULLIF(num_timed + num_requested, 0) AS avg_sync_ms
+FROM pg_stat_checkpointer;
+
+-- FPI ratio (high = too many first-page-writes after checkpoint)
+SELECT wal_fpi::float / NULLIF(wal_records, 0) * 100 AS fpi_pct
+FROM pg_stat_wal;
+
+-- Current WAL position and segment
+SELECT pg_current_wal_lsn(),
+       pg_walfile_name(pg_current_wal_lsn());
+```
+
+## Key Takeaways
+
+1. **Diagnose first** with `pg_stat_wal`, `pg_stat_checkpointer`, and `pg_stat_io`
+2. **Frequent checkpoints** → raise `max_wal_size`; **high FPI** → enable `wal_compression`
+3. **`wal_buffers_full`** → increase `wal_buffers`; **commit latency** → faster disk or async commit
+4. **pg_test_fsync** on the WAL disk is the single most important benchmark
+5. **NVMe vs HDD** requires fundamentally different tuning — what works on HDD (async commit, commit_delay) is unnecessary on NVMe
+
+<div class="self-check">
+<details>
+<summary>Quick Quiz: Performance Tuning</summary>
+
+1. **What does a rising wal_buffers_full counter indicate?**
+   → WAL buffers are too small for the write rate; backends block waiting for space. Increase wal_buffers.
+
+2. **When should you raise max_wal_size?**
+   → When pg_stat_checkpointer shows high num_requested (checkpoints triggered by WAL volume rather than timer).
+
+3. **What is the most important disk benchmark for WAL tuning?**
+   → pg_test_fsync — measures fsync latency, which directly bounds commit throughput.
+
+4. **Why enable wal_compression?**
+   → Reduces WAL volume by compressing Full-Page Images and large records — fewer bytes to fsync.
+
+5. **When is synchronous_commit = off acceptable?**
+   → Only for non-critical data (analytics, batch loads) where losing the last ~200ms of commits on crash is tolerable.
+
+6. **Why put WAL on a separate disk?**
+   → Isolates sequential WAL writes from random data page I/O, preventing I/O contention during checkpoints.
+
+</details>
+</div>

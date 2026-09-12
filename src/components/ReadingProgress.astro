@@ -1,0 +1,29 @@
+---
+---
+<div id="reading-progress" aria-hidden="true"></div>
+<script>
+  const KEY = 'wal-tutorial-progress';
+  const path = window.location.pathname;
+
+  const visited: string[] = JSON.parse(localStorage.getItem(KEY) || '[]');
+  if (!visited.includes(path)) {
+    visited.push(path);
+    localStorage.setItem(KEY, JSON.stringify(visited));
+  }
+
+  const bar = document.getElementById('reading-progress');
+  if (bar) {
+    window.addEventListener('scroll', () => {
+      const scrollable = document.body.scrollHeight - window.innerHeight;
+      const pct = scrollable > 0 ? window.scrollY / scrollable : 0;
+      bar.style.width = `${Math.min(pct * 100, 100)}%`;
+    }, { passive: true });
+  }
+
+  document.querySelectorAll('nav a').forEach(link => {
+    const anchor = link as HTMLAnchorElement;
+    if (visited.includes(new URL(anchor.href, window.location.origin).pathname)) {
+      anchor.classList.add('completed');
+    }
+  });
+</script>

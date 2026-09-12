@@ -1,0 +1,167 @@
+---
+title: "Cheat Sheet"
+description: "WAL quick reference — protocol, ARIES, config GUCs, monitoring queries, and log record types"
+sidebar:
+  order: 1
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A single-page reference for everything WAL. Bookmark this page.
+
+## WAL Protocol One-Liner
+
+> **Log records must be durable on stable storage before the modified data page is written to stable storage. A transaction is committed if and only if its COMMIT record is on stable storage.**
+
+## ARIES Three Passes
+
+| Pass | Input | Action | Output |
+|------|-------|--------|--------|
+| **Analysis** | WAL + last checkpoint | Build ATT (active txns) and DPT (dirty pages) | Redo start LSN, Undo list |
+| **Redo** | WAL from RedoLSN forward | Re-apply all logged changes (idempotent via page-LSN) | All pages reflect committed work |
+| **Undo** | Active txns from Analysis | Roll back uncommitted changes (write CLRs) | Clean state |
+
+```
+Crash → [Analysis] → ATT + DPT → [Redo: WAL forward] → [Undo: active txns backward] → Recovery complete
+```
+
+## Steal / Force Matrix
+
+|  | **Force** (flush at commit) | **No-Force** (defer flush) |
+|--|---------------------------|---------------------------|
+| **Steal** (flush before commit) | ❌ Never used | ✅ **ARIES** (PostgreSQL, InnoDB) |
+| **No-Steal** (keep dirty until commit) | Shadow Paging | ❌ Impractical |
+
+## PostgreSQL WAL Config — Top 10 GUCs
+
+| GUC | Default | When to Change |
+|-----|---------|----------------|
+| `wal_level` | `replica` | → `logical` for CDC |
+| `fsync` | `on` | **Never turn off** |
+| `synchronous_commit` | `on` | → `off` only for non-critical async workloads |
+| `wal_buffers` | `-1` (auto, ~shared_buffers/32) | → `64MB` if `wal_buffers_full` rising |
+| `max_wal_size` | `1GB` | → `4–16GB` if frequent checkpoints |
+| `min_wal_size` | `80MB` | → `1–2GB` to reduce WAL file creation |
+| `checkpoint_completion_target` | `0.9` | Keep at 0.9 (spread checkpoint I/O) |
+| `full_page_writes` | `on` | **Never turn off** (unless atomic page writes confirmed) |
+| `wal_compression` | `off` | → `on` or `lz4` (PG15+) to reduce FPI volume |
+| `wal_log_hints` | `off` | → `on` if using pg_rewind |
+
+```ini
+# Quick production template
+wal_level = replica
+fsync = on
+synchronous_commit = on
+wal_buffers = 16MB
+max_wal_size = 4GB
+checkpoint_completion_target = 0.9
+full_page_writes = on
+wal_compression = on
+```
+
+## SQLite WAL Mode Commands
+
+```sql
+PRAGMA journal_mode = WAL;          -- Enable WAL mode
+PRAGMA wal_autocheckpoint = 1000;   -- Auto-checkpoint every 1000 pages
+PRAGMA wal_checkpoint(PASSIVE);     -- Non-blocking checkpoint
+PRAGMA journal_size_limit = 67108864; -- Max WAL size (64MB)
+PRAGMA synchronous = FULL;          -- Durability level (FULL/NORMAL/OFF)
+```
+
+```bash
+# Files created in WAL mode
+database.db          # Main database (read by readers)
+database.db-wal      # Write-ahead log
+database.db-shm      # Shared memory index
+```
+
+## Key Monitoring Queries
+
+```sql
+-- WAL generation stats
+SELECT wal_records, wal_fpi, pg_size_pretty(wal_bytes),
+       wal_buffers_full, wal_write, wal_sync
+FROM pg_stat_wal;
+
+-- Checkpoint stats
+SELECT num_timed, num_requested,
+       write_time, sync_time, buffers_written
+FROM pg_stat_checkpointer;
+
+-- Replication slot lag
+SELECT slot_name, active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM pg_replication_slots;
+
+-- Current WAL position
+SELECT pg_current_wal_lsn(), pg_walfile_name(pg_current_wal_lsn());
+
+-- FPI ratio
+SELECT round(wal_fpi::numeric / NULLIF(wal_records, 0) * 100, 1) AS fpi_pct
+FROM pg_stat_wal;
+```
+
+```bash
+# Offline WAL inspection
+pg_waldump --verify-checksums --stop-on-error pg_wal/
+pg_test_fsync -f -s 1   # Test fsync latency on WAL disk
+```
+
+## fsync vs fdatasync
+
+| Call | Syncs Data | Syncs Metadata | Speed | Use Case |
+|------|-----------|---------------|-------|----------|
+| `fsync()` | ✓ | ✓ (size, mtime) | Slower | Full durability |
+| `fdatasync()` | ✓ | ✗ | Faster | WAL data (PostgreSQL default) |
+| `RWF_DSYNC` | ✓ | ✗ | Fastest (1 syscall) | io_uring linked writes |
+
+PostgreSQL uses `fdatasync` for WAL (data content matters, not file metadata).
+
+## Common Log Record Types
+
+| Record Type | Purpose | Example |
+|-------------|---------|---------|
+| **INSERT/UPDATE/DELETE** | Row-level changes | Heap2 rmgr |
+| **COMMIT/ABORT** | Transaction boundary | Transaction rmgr |
+| **CHECKPOINT** | Recovery starting point | XLOG checkpoint |
+| **FPI (Full-Page Image)** | Entire page snapshot | After checkpoint, first page touch |
+| **CLR** | Compensation Log Record | Undo action during recovery |
+| **HOT_UPDATE** | Heap-Only Tuple update | No index change |
+| **B-tree split/insert** | Index structure change | Btree rmgr |
+| **MULTIXACT** | Multi-transaction ID | Transaction rmgr |
+
+## Checkpoint Types
+
+| Type | Blocks Writers? | Blocks Readers? | Use |
+|------|----------------|-----------------|-----|
+| **PASSIVE** | No | No | Default auto-checkpoint |
+| **FULL** | At end (brief) | No | `CHECKPOINT` SQL command |
+| **RESTART** | Waits for all | No | SQLite — reset WAL after |
+| **TRUNCATE** | Waits for all | No | SQLite — truncate WAL to 0 |
+
+<Aside type="tip" title="Print This Page">
+This cheat sheet covers 80% of production WAL operations. Keep it handy during incident response.
+</Aside>
+
+<div class="self-check">
+<details>
+<summary>Quick Quiz: Cheat Sheet</summary>
+
+1. **State the WAL protocol in one sentence.**
+   → Log must be durable before data page; commit = COMMIT record durable.
+
+2. **What are ARIES's three passes?**
+   → Analysis (build ATT/DPT), Redo (replay WAL forward), Undo (roll back active txns).
+
+3. **What Steal/Force policy does ARIES use?**
+   → Steal + No-Force.
+
+4. **What GUC should you never turn off?**
+   → fsync (and full_page_writes in most cases).
+
+5. **What is the difference between fsync and fdatasync?**
+   → fsync syncs data + metadata; fdatasync syncs data only (faster, sufficient for WAL).
+
+</details>
+</div>

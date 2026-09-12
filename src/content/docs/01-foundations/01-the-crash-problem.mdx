@@ -1,0 +1,131 @@
+---
+title: "The Crash Problem"
+description: "Why databases need Write-Ahead Logging — understanding the fundamental problem"
+sidebar:
+  order: 1
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import CrashRecoveryDemo from '../../../components/CrashRecoveryDemo';
+
+Every database system faces an inconvenient truth: **computers crash**. Power failures, kernel panics, hardware faults, OOM kills — the question isn't *if* your system will crash, but *when*. Write-Ahead Logging exists to answer one question: **how do we keep data consistent despite crashes?**
+
+## The Fundamental Problem
+
+Consider a simple bank transfer: move $200 from Alice to Bob.
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 200 WHERE name = 'Alice';  -- Alice: 1000 → 800
+UPDATE accounts SET balance = balance + 200 WHERE name = 'Bob';    -- Bob:   500 → 700
+COMMIT;
+```
+
+This requires **two separate disk writes**. What if the system crashes between them?
+
+<Steps>
+1. **Alice debited** — her balance written to disk as $800
+2. **⚡ CRASH** — power lost
+3. **Bob never credited** — his balance still $500 on disk
+</Steps>
+
+Result: **$200 vanished from the system.** Alice lost money, Bob gained nothing. The database is now *inconsistent* — the invariant `Alice + Bob = $1500` is violated.
+
+<Aside type="tip" title="Memory Hook">
+Think of the crash problem as a **half-finished surgery**. You wouldn't want a surgeon to stop midway. Databases need the same guarantee: either the *entire* operation succeeds, or *none* of it takes effect.
+</Aside>
+
+## The Root Cause: Non-Atomic Multi-Page Writes
+
+The real issue is that **disk writes are not atomic across multiple pages**. A single disk sector write (512 bytes or 4KB) might be atomic, but a transaction often touches multiple pages scattered across the data file. There's no hardware primitive that says "write these 5 pages all-or-nothing."
+
+```
+Data File on Disk:
+┌─────────┬─────────┬─────────┬─────────┐
+│ Page 1  │ Page 2  │ Page 3  │ Page 4  │
+│ Alice:  │ Bob:    │ Index   │ ...     │
+│ $800 ✓  │ $500 ✗  │ stale   │         │
+└─────────┴─────────┴─────────┴─────────┘
+         ⚡ Crash happened here — only Page 1 was written
+```
+
+## Three Naive (Broken) Solutions
+
+Before understanding WAL, let's see why simpler approaches fail:
+
+### 1. "Just write everything at once"
+**Impossible.** No current hardware supports atomic writes across arbitrary sets of disk blocks. Even with battery-backed caches, the software still can't guarantee multi-page atomicity without a protocol.
+
+### 2. "Keep everything in memory"
+**Loses data on crash.** RAM is volatile. If you don't write to disk, everything is lost on power failure. This is acceptable for caches but not for durable databases.
+
+### 3. "Write to a temporary copy, then rename"
+**Shadow paging** (used in early systems like System R). Create a copy of every modified page, write changes to the copy, then atomically swap pointers.
+
+Problems:
+- Requires doubling disk space
+- Scatters pages across disk (destroys locality)
+- Doesn't scale — entire page tables must be swapped atomically
+- Still needs something like WAL for the pointer swap itself
+
+<Aside type="note" title="Self-Check">
+Before reading on: can you explain why "just writing data carefully" isn't enough? What specific property of disk hardware makes crashes dangerous?
+
+**Answer:** Disk writes are sector-atomic but not *transaction-atomic*. A transaction touching N pages produces N independent disk writes. Any crash between writes leaves a partial state.
+</Aside>
+
+## The Insight: Sequential Log as Safety Net
+
+The key insight behind WAL is beautifully simple:
+
+> **Before modifying any data page, first write a description of the change to a sequential log file. If you crash, replay the log to recover.**
+
+This works because:
+1. **Sequential writes are fast** — appending to a log is much faster than random page writes
+2. **A single sequential file can be fsynced atomically** — one `fsync()` call makes the entire log durable
+3. **The log contains enough information to reconstruct any change** — it's the source of truth
+
+## See It In Action
+
+Try the simulator below. Watch what happens with and without WAL when a crash occurs:
+
+<div class="simulator-container">
+<h3>Interactive: Crash Recovery — With vs Without WAL</h3>
+<CrashRecoveryDemo client:visible />
+</div>
+
+<Aside type="tip" title="Memory Hook: The Recipe Analogy">
+WAL is like **writing down a recipe before cooking**. If the kitchen catches fire mid-cooking, you can rebuild the dish from the recipe. Without the recipe (no WAL), you're left with a half-cooked mess and no idea what the finished dish should look like.
+</Aside>
+
+## The Cost of Safety
+
+WAL isn't free. It introduces:
+
+| Cost | Description |
+|------|-------------|
+| **Write amplification** | Every change is written twice — once to WAL, once to data file |
+| **Disk space** | WAL file grows until checkpointed |
+| **Recovery time** | After crash, log must be replayed before database is usable |
+| **Complexity** | Checkpointing, log management, concurrent access to log |
+
+Despite these costs, WAL is **universally adopted** because the alternative — data loss and corruption — is unacceptable for any serious database.
+
+## What's Next
+
+Now that you understand *why* WAL exists, the next chapter covers the ACID properties and the specific durability guarantees WAL provides. Then we'll dive into the buffer management policies (Steal/Force) that determine exactly what kind of recovery protocol a database needs.
+
+<div class="self-check">
+<details>
+<summary>Quick Quiz: The Crash Problem</summary>
+
+1. **Why can't databases just write data pages directly?**
+   → Multi-page writes are not atomic. A crash mid-write leaves an inconsistent state.
+
+2. **What makes WAL different from shadow paging?**
+   → WAL uses a single sequential log (fast, simple) instead of copying entire pages (slow, space-intensive). WAL writes are append-only and can be batch-fsynced.
+
+3. **What's the minimum number of durable writes needed to commit a transaction with WAL?**
+   → One: the WAL fsync. Data page writes are deferred (asynchronous). This is the "No-Force" policy.
+</details>
+</div>

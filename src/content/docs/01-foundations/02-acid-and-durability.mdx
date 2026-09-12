@@ -1,0 +1,180 @@
+---
+title: "ACID & Durability"
+description: "How WAL enables ACID properties — the durability stack from application to spinning platters"
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import WalFlowSimulator from '../../../components/WalFlowSimulator';
+
+WAL doesn't exist in isolation — it's the mechanism that enables the **ACID** guarantees every serious database promises. Let's understand exactly how WAL maps to each property, with special focus on Durability.
+
+## ACID Properties and WAL's Role
+
+| Property | Definition | WAL's Role |
+|----------|-----------|------------|
+| **Atomicity** | All operations in a transaction succeed or none do | WAL enables **undo**: if a transaction fails, its logged changes are reversed |
+| **Consistency** | Database moves from one valid state to another | WAL + undo/redo ensures only complete transactions are visible |
+| **Isolation** | Concurrent transactions don't interfere | Not directly provided by WAL — handled by locks/MVCC (but WAL supports MVCC via undo logs) |
+| **Durability** | Once committed, data survives any failure | **WAL's primary mission**: commit record fsync'd → data is permanent |
+
+<Aside type="tip" title="Memory Hook: WAL = AD in ACID">
+WAL primarily provides **A**tomicity and **D**urability. **I**solation comes from concurrency control (locks, MVCC). **C**onsistency emerges from the combination of all three.
+</Aside>
+
+## The Durability Stack
+
+Durability isn't a single mechanism — it's a stack of layers from your application down to physical media. Understanding this stack is what separates beginners from experts.
+
+```
+┌─────────────────────────────────┐
+│  Application: COMMIT;           │  ← Your SQL statement
+├─────────────────────────────────┤
+│  Database: WAL append + fsync   │  ← Log record written & synced
+├─────────────────────────────────┤
+│  OS: write() + fsync()          │  ← System calls to kernel
+├─────────────────────────────────┤
+│  Filesystem: journal + writeback│  ← ext4/XFS/ZFS page cache
+├─────────────────────────────────┤
+│  Block layer: I/O scheduler     │  ← Merging, reordering writes
+├─────────────────────────────────┤
+│  Storage: disk write cache      │  ← DRAM cache on SSD/HDD
+├─────────────────────────────────┤
+│  Media: NAND flash / platters   │  ← Actual persistent storage
+└─────────────────────────────────┘
+```
+
+**A write is only truly durable when it reaches the bottom of this stack.** Every layer above can lose data on power failure.
+
+## fsync: The Durability Boundary
+
+The critical system call is `fsync()` (or `fdatasync()`). It tells the OS: "flush all cached writes for this file to persistent storage and don't return until they're there."
+
+| System Call | Flushes Data | Flushes Metadata | Used By |
+|-------------|-------------|-----------------|---------|
+| `write()` | To page cache only | No | Everyone (not durable!) |
+| `fsync(fd)` | To disk | Yes (size, mtime) | PostgreSQL default on some OSes |
+| `fdatasync(fd)` | To disk | Only if needed for data access | PostgreSQL default on Linux |
+| `O_DSYNC` flag | On each write | Only if needed | Some databases |
+| `O_SYNC` flag | On each write | Yes | Rare |
+
+<Aside type="caution" title="Critical Understanding">
+**`write()` alone does NOT provide durability.** Data sits in the OS page cache (RAM) until flushed. A power failure after `write()` but before `fsync()` loses the data. This is why WAL calls `fsync()` on the log file at commit time.
+</Aside>
+
+### The Hidden Danger: Disk Write Caches
+
+Even `fsync()` can lie! Consumer SSDs and HDDs have volatile write caches (DRAM). When `fsync()` returns, data may be in the drive's cache, not in NAND/platters.
+
+- **Enterprise SSDs**: Usually have power-loss protection (PLP) — capacitors flush cache to NAND on power loss
+- **Consumer SSDs**: Often no PLP. `fsync()` may not be truly durable
+- **HDDs**: Write cache enabled by default. Disable with `hdparm -W0`
+- **Cloud block storage**: Provider-dependent. AWS EBS is designed to be durable after `fsync()`
+
+<Aside type="tip" title="Expert Tip">
+PostgreSQL provides `pg_test_fsync` to benchmark actual fsync latency on your hardware. If fsync is very fast (under 0.1ms), your storage might be lying about durability. Enterprise NVMe typically shows 0.1-0.5ms.
+</Aside>
+
+## The WAL Commit Path
+
+Here's the exact sequence when a transaction commits with WAL:
+
+```
+1. Transaction writes changes to buffer pool pages (in memory)
+2. For each change, a WAL record is appended to WAL buffer (in memory)
+3. At COMMIT:
+   a. Append COMMIT record to WAL buffer
+   b. Write WAL buffer to WAL file (write syscall)
+   c. fsync() the WAL file        ← DURABILITY BOUNDARY
+   d. Return "success" to client   ← Transaction is committed
+4. Later (async): dirty pages flushed from buffer pool to data files
+```
+
+The crucial insight: **step 3c is the only sync I/O in the commit path**. Data pages are written lazily. This is what makes WAL fast.
+
+### Try It: WAL Flow Simulator
+
+Step through the commit path and inject crashes at different points to see what survives:
+
+<div class="simulator-container">
+<h3>Interactive: WAL Commit Flow</h3>
+<WalFlowSimulator client:visible />
+</div>
+
+## Synchronous vs Asynchronous Commit
+
+Not all durability is equal. Many databases let you trade durability for speed:
+
+### Synchronous Commit (default)
+```
+COMMIT → WAL write → fsync → ACK client
+```
+**Guarantee:** Committed data survives power failure.
+**Cost:** Latency of one disk sync per commit (~0.1-10ms depending on hardware).
+
+### Asynchronous Commit
+```
+COMMIT → WAL write (no fsync) → ACK client → (WAL writer fsyncs later)
+```
+**Guarantee:** Committed data survives *process* crash but may lose last ~few transactions on *power* failure.
+**Cost:** Near-zero commit latency.
+
+In PostgreSQL: `SET synchronous_commit = off;`
+
+The data loss window for async commit is approximately `3 × wal_writer_delay` (default 600ms). This means at most ~600ms of recent transactions can be lost on power failure — but the database will never be *corrupt*, just missing the last few commits.
+
+<Aside type="note" title="Self-Check">
+**Question:** With `synchronous_commit = off`, what happens if the system crashes 200ms after your COMMIT returned success?
+
+**Answer:** Your transaction *might* be lost (the WAL writer hasn't fsynced yet). But the database is still consistent — it looks like your transaction never happened. No corruption, no partial state. You lost the write, but the world is coherent.
+</Aside>
+
+## WAL and ACID: The Complete Picture
+
+```
+                    ┌──────────────────────────────┐
+                    │         ACID                  │
+                    │                               │
+                    │  ┌─────────┐  ┌──────────┐   │
+   WAL provides ──→ │  │Atomicity│  │Durability│   │
+                    │  └─────────┘  └──────────┘   │
+                    │                               │
+                    │  ┌─────────┐  ┌───────────┐  │
+                    │  │Isolation│  │Consistency│  │
+                    │  └────┬────┘  └─────┬─────┘  │
+                    │       │             │        │
+                    │   Locks/MVCC    All three    │
+                    └──────────────────────────────┘
+```
+
+- **Atomicity**: WAL records all changes. On crash, incomplete transactions are undone.
+- **Durability**: COMMIT record fsynced to WAL → survives any failure.
+- **Isolation**: MVCC/locks (WAL supports MVCC by preserving old versions in undo log).
+- **Consistency**: Emerges from A+I+D working together. Constraints checked at commit time.
+
+## Key Takeaways
+
+1. **Durability is a stack**, not a single mechanism. Every layer must participate.
+2. **fsync is the durability boundary**. Everything above it is volatile.
+3. **WAL makes COMMIT fast** by deferring data page writes. Only the log needs sync I/O.
+4. **Async commit trades durability for speed** — data loss window but never corruption.
+5. **Hardware matters**: enterprise SSDs with PLP, proper fsync, `pg_test_fsync`.
+
+<div class="self-check">
+<details>
+<summary>Quick Quiz: ACID & Durability</summary>
+
+1. **Which ACID properties does WAL directly enable?**
+   → Atomicity (undo incomplete txns) and Durability (fsync'd commit record).
+
+2. **Why is `write()` without `fsync()` not durable?**
+   → `write()` only copies data to OS page cache (RAM). Power failure loses it.
+
+3. **What's the difference between process crash and power failure for async commit?**
+   → Process crash: WAL is in OS page cache, which survives → data is safe. Power failure: OS page cache lost → unfsynced data is lost.
+
+4. **Why do enterprise SSDs have capacitors?**
+   → To flush the volatile DRAM write cache to NAND flash on power loss, making `fsync()` truly durable.
+</details>
+</div>

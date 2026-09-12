@@ -1,0 +1,168 @@
+---
+title: "Glossary"
+description: "Complete WAL glossary — ~60 terms in alphabetical order"
+sidebar:
+  order: 4
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A comprehensive reference of WAL terminology. Every term used throughout this tutorial, defined concisely.
+
+## A
+
+**ARIES** — Algorithm for Recovery and Isolation Exploiting Semantics. The standard three-pass crash recovery method (Analysis, Redo, Undo) used by PostgreSQL, DB2, and SQL Server.
+
+**ATT (Active Transaction Table)** — ARIES data structure built during Analysis pass. Maps transaction IDs to their last LSN. Determines which transactions need undo.
+
+## C
+
+**CDC (Change Data Capture)** — Reading committed changes from the WAL (via logical decoding) to feed downstream systems. Eliminates the dual-write problem of application-level event publishing.
+
+**Checkpoint** — A point in the WAL where all dirty buffer pool pages are flushed to disk. Bounds recovery redo scan and enables WAL segment recycling.
+
+**CLR (Compensation Log Record)** — A log record written during undo to mark a rollback action as complete. CLRs are never undone themselves, preventing infinite undo loops on repeated crashes.
+
+**Commit** — The transaction completion point. In WAL systems, a transaction is committed when its COMMIT record is durable on stable storage — not when data pages are written.
+
+**CRC (Cyclic Redundancy Check)** — Checksum appended to WAL records for corruption detection. PostgreSQL uses CRC-32C; SQLite uses cumulative checksums per frame.
+
+## D
+
+**Dirty Page Table (DPT)** — ARIES data structure mapping page IDs to RecLSN (earliest LSN requiring redo for that page). Built during Analysis pass.
+
+**DPT** — See Dirty Page Table.
+
+## E
+
+**End Mark** — A marker in some WAL formats indicating the end of valid records in a segment. Used during recovery to find the log tail.
+
+## F
+
+**FPI (Full-Page Image)** — A complete snapshot of a data page written to WAL, typically after a checkpoint on first modification. Protects against torn page writes during recovery.
+
+**Force** — Buffer management policy requiring modified pages to be flushed to disk at transaction commit. ARIES uses No-Force (only WAL must be durable at commit).
+
+**Force/No-Force** — See Steal/Force matrix. Force = flush pages at commit; No-Force = defer page flush (WAL fsync suffices).
+
+**Full-Page Image** — See FPI.
+
+**fsync** — System call forcing all buffered data for a file descriptor to stable storage. The durability boundary for WAL commits.
+
+**fdatasync** — Like fsync but syncs only data content, not file metadata (size, timestamps). Faster; used by PostgreSQL for WAL.
+
+## G
+
+**Group Commit** — Optimization batching multiple transaction commits into a single WAL fsync. Amortizes fsync cost across concurrent writers.
+
+## I
+
+**Idempotent** — Property of redo operations: applying the same log record multiple times produces the same result. Achieved via page-LSN comparison — skip if page-LSN ≥ record LSN.
+
+## L
+
+**LSM (Log-Structured Merge-tree)** — Storage engine architecture (RocksDB, Pebble) where writes go to an in-memory memtable + WAL, then flush to immutable SSTables. WAL protects the memtable, not individual pages.
+
+**LSN (Log Sequence Number)** — Monotonically increasing identifier for a position in the WAL stream. PostgreSQL uses 64-bit byte offsets; other systems may use record counters.
+
+## M
+
+**Mini-transaction (mtr)** — InnoDB's internal atomic unit of work on B-tree pages. An mtr generates redo/undo records and holds page latches. Shorter-lived than a SQL transaction.
+
+**MVCC (Multi-Version Concurrency Control)** — Concurrency mechanism keeping multiple versions of rows. Interacts with WAL: readers don't block WAL writers; undo records support rollback and consistent reads.
+
+## N
+
+**No-Force** — Buffer policy deferring page flush until checkpoint. Commit requires only WAL durability. Used by ARIES.
+
+**No-Steal** — Buffer policy preventing dirty pages from being flushed before transaction commit. Simplifies recovery but limits buffer pool utilization.
+
+**NVM (Non-Volatile Memory)** — Storage that retains data without power (e.g., Intel Optane). Byte-addressable via mmap; durability via CLWB+SFENCE instead of fsync.
+
+## P
+
+**Page-LSN** — The LSN of the most recent WAL record affecting a data page. Stored in the page header. Used during redo to skip already-applied records (idempotency check).
+
+**PITR (Point-In-Time Recovery)** — Restoring a database to a specific moment by replaying archived WAL from a base backup. Requires continuous WAL archiving.
+
+**Physiological Logging** — Log records that are physical at the page level (identify which page) but logical within the page (describe the operation). Used by PostgreSQL and InnoDB.
+
+**PMEM (Persistent Memory)** — See NVM. Specifically refers to byte-addressable persistent memory (Intel Optane, CXL-attached memory).
+
+## R
+
+**RecLSN** — Recovery LSN. In the DPT, the earliest LSN that must be redone for a given page. Pages with no dirty records are absent from the DPT.
+
+**Redo** — Recovery pass that re-applies all logged changes forward from RedoLSN. Idempotent via page-LSN comparison. Ensures all committed work is reflected in data pages.
+
+**RedoLSN** — The LSN from which the redo pass begins. Minimum RecLSN across all pages in the DPT (or checkpoint RedoLSN if DPT is empty).
+
+**Replication Slot** — PostgreSQL mechanism tracking a consumer's progress in the WAL stream. Prevents WAL recycling until the consumer has processed all records from `restart_lsn`.
+
+**Resource Manager (rmgr)** — PostgreSQL component dispatching WAL record redo by category (Heap, Btree, Transaction, etc.). Each rmgr handles its own record types.
+
+**Rollback Journal** — SQLite's default journaling mode. Writes original page content to a journal file before modifying the database. Simpler than WAL but lower concurrency.
+
+## S
+
+**Shadow Paging** — Alternative to WAL where modifications write to new page copies; the root pointer is atomically switched on commit. Used by System R. No redo needed but write amplification is high.
+
+**Steal** — Buffer policy allowing dirty pages to be flushed before transaction commit. Requires undo capability. Used by ARIES.
+
+**Steal/Force** — The four-quadrant buffer management policy matrix. ARIES uses Steal/No-Force.
+
+## T
+
+**Torn Page** — A data page partially written during a crash — containing a mix of old and new content. Typically occurs when a multi-sector page write is interrupted. Prevented by Full-Page Images.
+
+## U
+
+**Undo** — Recovery pass that rolls back uncommitted transactions by reversing their changes. Generates CLRs. Processes active transactions from ATT in reverse LSN order.
+
+**UndoNxtLSN** — In ARIES, the LSN of the next undo record for a transaction. Traversed backward during the undo pass.
+
+## W
+
+**WAL (Write-Ahead Log)** — An append-only log of database modifications written to stable storage before the corresponding data pages. The foundation of crash recovery and durability.
+
+**WAL Buffer** — In-memory buffer (shared memory ring in PostgreSQL) where backends write log records before the WAL writer flushes them to disk.
+
+**WAL File** — On-disk WAL storage unit. PostgreSQL: 16MB segments; SQLite: single `-wal` file; RocksDB: per-memtable WAL files.
+
+**WAL-Index** — SQLite's shared memory structure indexing WAL frame locations. Enables concurrent readers to find frames without scanning the entire WAL file.
+
+**WAL-Reset Bug** — SQLite race condition (2010–2026) where concurrent checkpoint reset and writer append caused silent data loss. Fixed in SQLite 3.x.x.
+
+**WBL (Write-Behind Logging)** — Research technique inverting WAL order: write data pages first on NVM, log metadata only. 1.3x throughput, 100x faster recovery. NVM-only.
+
+**Write Amplification** — Ratio of bytes written to storage vs bytes of actual data change. WAL contributes amplification via FPIs, redundant records, and checkpoint flushes.
+
+## X
+
+**XLogRecord** — PostgreSQL's WAL record header structure (24 bytes): total length, transaction ID, previous LSN, info flags, resource manager ID, and CRC checksum.
+
+<Aside type="tip" title="Use This Glossary">
+Encounter an unfamiliar term while reading? Ctrl+F this page. Every WAL concept used in the tutorial is defined here.
+</Aside>
+
+<div class="self-check">
+<details>
+<summary>Quick Quiz: Glossary</summary>
+
+1. **What is the difference between RecLSN and RedoLSN?**
+   → RecLSN is per-page (earliest LSN to redo for that page). RedoLSN is global (minimum RecLSN across DPT — where redo pass starts).
+
+2. **What does No-Force mean?**
+   → Modified pages don't need to be flushed at commit — only WAL durability is required.
+
+3. **What is a CLR and why is it needed?**
+   → Compensation Log Record — marks an undo action as complete so re-recovery after a crash during undo doesn't repeat the rollback.
+
+4. **What is the WAL-Reset Bug?**
+   → SQLite race where checkpoint truncates WAL while a concurrent writer appends, making the frame invisible (silent data loss).
+
+5. **What is physiological logging?**
+   → Physical at page level (which page), logical within page (what operation) — as opposed to pure physical (byte diffs) or pure logical (SQL statements).
+
+</details>
+</div>

@@ -1,0 +1,172 @@
+---
+title: "Steal/Force Matrix"
+description: "Buffer management policies that determine what kind of recovery a database needs"
+sidebar:
+  order: 3
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import StealForceMatrix from '../../../components/StealForceMatrix';
+
+Before diving into WAL mechanics, you must understand two orthogonal buffer management policies that fundamentally determine what kind of recovery protocol a database needs. Every database system makes these two choices, and the combination dictates the entire recovery architecture.
+
+## Two Independent Policy Axes
+
+### Steal vs No-Steal: "Can we evict uncommitted dirty pages?"
+
+The buffer pool has limited memory. When it's full and a new page is needed, should the system be allowed to **steal** (evict) a dirty page from an uncommitted transaction?
+
+| Policy | Definition | Implication |
+|--------|-----------|-------------|
+| **Steal** | Buffer manager CAN flush uncommitted dirty pages to disk | Requires **UNDO** capability — must reverse changes from aborted transactions that reached disk |
+| **No-Steal** | Buffer manager must KEEP uncommitted dirty pages in memory | No undo needed, but memory pressure can stall transactions |
+
+### Force vs No-Force: "Must all pages be on disk at commit?"
+
+When a transaction commits, must all its dirty pages be forced to disk before acknowledging the client?
+
+| Policy | Definition | Implication |
+|--------|-----------|-------------|
+| **Force** | ALL modified pages written to disk at COMMIT | No **REDO** needed — committed data is always on disk |
+| **No-Force** | Modified pages can stay in memory after COMMIT | Requires **REDO** capability — committed data might only be in the log |
+
+<Aside type="tip" title="Memory Hook: Steal/Force Rhyme">
+- **Steal** → "Steal pages out, Undo to put them right"
+- **Force** → "Force pages down, no Redo tonight"
+- **No-Steal** → "No stealing means no Undo pain"
+- **No-Force** → "No forcing means Redo's your game"
+</Aside>
+
+## The 2×2 Matrix
+
+Click each cell below to explore its trade-offs:
+
+<div class="simulator-container">
+<h3>Interactive: Steal/Force Policy Matrix</h3>
+<StealForceMatrix client:visible />
+</div>
+
+## Why Steal + No-Force Wins
+
+Virtually every production database uses **Steal + No-Force** despite requiring the most complex recovery (both REDO and UNDO). Here's why:
+
+### Performance Argument
+
+**No-Force** eliminates synchronous random I/O at commit time:
+- With Force: COMMIT must flush N dirty pages → N random disk writes → slow
+- With No-Force: COMMIT only fsyncs the WAL → 1 sequential write → fast
+
+**Steal** prevents memory stalls:
+- With No-Steal: Long transactions pin pages in memory → buffer pool exhaustion
+- With Steal: Buffer manager freely evicts any page → predictable memory usage
+
+```
+Performance Impact:
+                    No-Steal           Steal
+                    ────────           ─────
+   Force         │ Worst (slow      │ Moderate
+                 │ commit + memory  │ (slow commit,
+                 │ pressure)        │  free memory)
+                 │                  │
+   No-Force      │ Moderate (fast   │ ★ Best (fast
+                 │ commit, memory   │ commit + free
+                 │ pressure)        │  memory)
+```
+
+### The WAL Protocol Makes It Safe
+
+The entire WAL protocol exists to make Steal + No-Force safe:
+
+1. **WAL Rule (Write-Ahead):** Before any dirty page is written to disk, all log records up to that page's LSN must be flushed. This ensures we can always REDO committed changes.
+
+2. **Force-at-commit for the LOG (not data):** WAL is force-written at commit. The log is the durability guarantee, not the data pages.
+
+3. **Undo information in the log:** Each log record contains enough information to reverse the change, enabling rollback of stolen uncommitted pages.
+
+<Aside type="caution" title="Critical Distinction">
+**Force the LOG, not the DATA.** This is the key insight. WAL forces *one sequential file* at commit (cheap) instead of forcing *many scattered data pages* (expensive). The data pages are written lazily during checkpoint.
+</Aside>
+
+## How Real Systems Choose
+
+| System | Steal? | Force? | Recovery Model |
+|--------|--------|--------|---------------|
+| PostgreSQL | Steal | No-Force | ARIES-style redo + undo |
+| MySQL/InnoDB | Steal | No-Force | Redo log + undo log |
+| SQLite (WAL mode) | Steal | No-Force | WAL replay + rollback |
+| Oracle | Steal | No-Force | Redo + undo tablespaces |
+| SQL Server | Steal | No-Force | ARIES-based recovery |
+| MongoDB (WiredTiger) | Steal | No-Force | Journal replay |
+| RocksDB | N/A* | No-Force | WAL replay to memtable |
+
+*LSM engines like RocksDB don't have a traditional buffer pool — writes go to memtable (memory) then flush to SSTables. The WAL protects unflushed memtable data.
+
+## The Steal Problem in Detail
+
+When a dirty page from an uncommitted transaction is stolen (written to disk), what happens if that transaction later aborts?
+
+```
+Timeline:
+1. T1: Modify Page 5 (in buffer pool)
+2. Buffer pool full — Page 5 stolen to disk (T1 still active!)
+3. T1: ABORT
+4. Problem: Page 5 on disk has T1's uncommitted change!
+```
+
+**Solution: UNDO.** The WAL contains the before-image (or enough info to reverse the change). During abort or crash recovery, the undo pass reverses all changes from uncommitted transactions that reached disk.
+
+## The No-Force Problem in Detail
+
+When a transaction commits but its dirty pages haven't been flushed:
+
+```
+Timeline:
+1. T2: Modify Page 3, Page 7 (in buffer pool)
+2. T2: COMMIT → WAL fsynced ✓
+3. ⚡ CRASH — Pages 3, 7 never written to disk
+4. Problem: Committed data only exists in WAL!
+```
+
+**Solution: REDO.** During crash recovery, the redo pass scans the WAL forward and re-applies all changes from committed transactions whose data pages are stale.
+
+## Connecting to ARIES
+
+The ARIES recovery algorithm (which we'll study in depth in Chapter 3) is specifically designed for the Steal + No-Force policy:
+
+| ARIES Phase | Handles | Policy |
+|-------------|---------|--------|
+| **Analysis** | Determines what needs redo/undo | Both |
+| **Redo** | Re-applies committed changes missing from disk | No-Force |
+| **Undo** | Reverses uncommitted changes present on disk | Steal |
+
+<Aside type="note" title="Self-Check">
+**Question:** A system uses No-Steal + Force. Does it need WAL at all?
+
+**Answer:** Technically no — committed data is always on disk (Force), and uncommitted data is never on disk (No-Steal). But this combination has terrible performance: every COMMIT requires flushing all dirty pages (random I/O), and the buffer pool can't evict pages from long transactions (memory pressure). No production database uses this.
+</Aside>
+
+## Key Takeaways
+
+1. **Steal** = uncommitted pages can be on disk → needs **UNDO**
+2. **No-Force** = committed pages might not be on disk → needs **REDO**
+3. **Steal + No-Force** requires both REDO and UNDO but gives the best performance
+4. **Every production database uses Steal + No-Force** with WAL to make it safe
+5. The WAL protocol is the force-at-commit for the **log**, not the data files
+
+<div class="self-check">
+<details>
+<summary>Quick Quiz: Steal/Force Matrix</summary>
+
+1. **What does "Steal" mean and what recovery capability does it require?**
+   → Steal means the buffer manager can evict uncommitted dirty pages to disk. It requires UNDO capability.
+
+2. **Why is No-Force desirable despite needing REDO?**
+   → No-Force means COMMIT only needs to fsync the WAL (sequential, fast) instead of all dirty pages (random I/O, slow).
+
+3. **Can you have Steal without WAL?**
+   → No — without WAL, stolen uncommitted pages can't be undone after a crash. The before-images in the WAL are what makes undo possible.
+
+4. **What would happen if PostgreSQL used a No-Steal policy?**
+   → Long transactions would pin pages in the buffer pool. Under memory pressure, new transactions would stall waiting for buffer space. OOM scenarios become likely.
+</details>
+</div>
